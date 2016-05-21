@@ -15,6 +15,7 @@ import (
 
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
+	"github.com/rs/cors"
 )
 
 const (
@@ -98,7 +99,8 @@ type SizeBestFit struct {
 type RegionFull struct {
 }
 
-// derviced from original size and a region transformation
+// Region derived from original size and a region transformation
+// ^ Is this comment out of date?
 type Region struct {
 	X      int
 	Y      int
@@ -155,25 +157,34 @@ func main() {
 
 	router.HandleFunc("/", helloHandler)
 	// TODO(cgag): prefix is optional, need to handle that as well
+	router.HandleFunc("/{prefix}/{identifier}", baseRedirect)
 	router.HandleFunc("/{prefix}/{identifier}/{region}/{size}/{rotation}/{quality}.{format}", iiifHandler)
 	router.HandleFunc("/{prefix}/{identifier}/info.json", infoHandler)
 
 	// TODO(cgag): request timing
 	s := &http.Server{
-		Addr:    ":8080",
-		Handler: handlers.CombinedLoggingHandler(os.Stdout, handlers.CORS()(router)),
+		Addr: ":8080",
+		// Handler: handlers.CORS()(handlers.CombinedLoggingHandler(os.Stdout, router)),
+		Handler: cors.Default().Handler(handlers.CombinedLoggingHandler(os.Stdout, router)),
 	}
 
 	log.Printf("Listening on: %s", s.Addr)
 	s.ListenAndServe()
 }
 
-// are you kidding me golang
-func round(a float64) float64 {
-	if a < 0 {
-		return math.Ceil(a - 0.5)
+func baseRedirect(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	prefix, ok := vars["prefix"]
+	if !ok {
+		log.Panicln("Failed to parse prefix from URL")
 	}
-	return math.Floor(a + 0.5)
+
+	identifier, ok := vars["identifier"]
+	if !ok {
+		log.Panicln("Failed to parse identifier from URL")
+	}
+
+	http.Redirect(w, r, "/"+prefix+"/"+identifier+"/info.json", http.StatusSeeOther)
 }
 
 func helloHandler(w http.ResponseWriter, r *http.Request) {
@@ -194,120 +205,18 @@ func iiifHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// formats, err := getFormats(imgReq.Identifier)
-	// if err != nil {
-	// 	w.WriteHeader(http.StatusInternalServerError)
-	// 	return
-	// }
-
-	stats, err := imgStats(imgReq.toPath())
+	args, err := imgReq.buildArgs()
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	// TODO(cgag): a tempfile system for caching?
-	cmd := "convert"
-
-	switch imgReq.Region.(type) {
-	case RegionFull:
-		break
-	case RegionExact:
-		region := imgReq.Region.(RegionExact)
-		cmd = fmt.Sprintf(
-			"%s -crop %dx%d+%d+%d",
-			cmd,
-			region.Width,
-			region.Height,
-			region.X,
-			region.Y)
-	case RegionPercent:
-		region := imgReq.Region.(RegionPercent)
-		offsetX := int(round(float64(stats.Width) * region.X / 100.0))
-		offsetY := int(round(float64(stats.Height) * region.Y / 100.0))
-		cmd = fmt.Sprintf(
-			"%s -crop %f%%x%f+%d+%d",
-			cmd,
-			region.Width,
-			region.Height,
-			offsetX,
-			offsetY,
-		)
-	default:
-		fmt.Fprintf(w, "Unrecognized region type: %v\n", imgReq.Region)
-	}
-
-	switch imgReq.Size.(type) {
-	case SizeFull:
-		break
-	case SizeHeight:
-		fmt.Println("resizing height")
-		resize := imgReq.Size.(SizeHeight)
-		cmd = fmt.Sprintf(
-			"%s -resize x%d",
-			cmd,
-			resize.Height,
-		)
-	case SizeWidth:
-		fmt.Println("size width")
-		resize := imgReq.Size.(SizeWidth)
-		cmd = fmt.Sprintf(
-			"%s -resize %dx",
-			cmd,
-			resize.Width,
-		)
-	case SizeExact:
-		fmt.Println("resizing exact")
-		resize := imgReq.Size.(SizeExact)
-		cmd = fmt.Sprintf(
-			"%s -resize %dx%d!",
-			cmd,
-			resize.Width,
-			resize.Height,
-		)
-	case SizePercent:
-		resize := imgReq.Size.(SizePercent)
-		cmd = fmt.Sprintf(
-			"%s -resize %%%f",
-			cmd,
-			resize.Percent,
-		)
-	case SizeBestFit:
-		resize := imgReq.Size.(SizeBestFit)
-		cmd = fmt.Sprintf(
-			"%s -resize %dx%d",
-			cmd,
-			resize.Width,
-			resize.Height,
-		)
-	default:
-		fmt.Fprintf(w, "Unrecognized size type: %v\n", imgReq.Size)
-	}
-
-	switch imgReq.Rotation.(type) {
-	case RotateStandard:
-		// fmt.Fprintf(w, "RotateStandard: %v\n", imgReq.Rotation)
-		break
-	case RotateMirrored:
-		fmt.Fprintf(w, "RotateMirrored: %v\n", imgReq.Rotation)
 		w.WriteHeader(http.StatusBadRequest)
-		return
-	default:
-		fmt.Fprintf(w, "Unrecognized rotation : %v\n", imgReq.Rotation)
-		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, "Error with request:  %s\n", err)
 		return
 	}
 
-	// Output to stdout.
-	cmd = fmt.Sprintf("%s %s %s:-", cmd, imgReq.toPath(), imgReq.Format)
-
-	fmt.Printf("\n\ncommand: %s\n\n", cmd)
-
-	cmdParts := strings.Split(cmd, " ")
-	name, args := cmdParts[0], cmdParts[1:]
-	out, err := exec.Command(name, args...).Output()
+	fmt.Printf("\n\nargs: %s\n\n", args)
+	splitArgs := strings.Split(strings.TrimSpace(args), " ")
+	out, err := exec.Command("convert", splitArgs...).Output()
 	if err != nil {
-		fmt.Printf("err: %s\n\n", err)
+		fmt.Printf("err running convert: %s\n\n", err)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
@@ -318,9 +227,17 @@ func iiifHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func infoHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	wants, ok := r.Header["Accept"]
+	if !ok || wants[0] == "application/json" {
+		w.Header().Set("Content-Type", "application/json")
+	} else if wants[0] == "application/ld+json" {
+		w.Header().Set("Content-Type", "application/ld+json")
+	}
+
 	iReq := infoReq(r)
-	iResp, err := infoResp(iReq)
+	iResp, err := iReq.infoResp()
 	if err != nil {
 		fmt.Printf("err: %s", err)
 		w.WriteHeader(http.StatusNotFound)
@@ -329,7 +246,7 @@ func infoHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(iResp)
 }
 
-func infoResp(iReq InfoReq) (*ImageInfo, error) {
+func (iReq InfoReq) infoResp() (*ImageInfo, error) {
 	// TODO(cgag): where should "test_images" have come from? Is using
 	// Prefix reasonable?
 	formats, err := getFormats(iReq.Identifier)
@@ -359,7 +276,6 @@ func infoResp(iReq InfoReq) (*ImageInfo, error) {
 
 func getFormats(identifier string) ([]string, error) {
 	possibleFormats := []string{"png", "jpg", "tiff", "jp", "jp2"}
-
 	// TODO(cgag): parallelize?
 	var found []string
 	for _, format := range possibleFormats {
@@ -380,14 +296,145 @@ func imgExists(path string) bool {
 	return true
 }
 
-func imgStats(filepath string) (*WidthHeight, error) {
+func imgStats(filepath string) (WidthHeight, error) {
 	out, err :=
 		exec.Command("identify", "-ping", "-format", "%w,%h", filepath).Output()
 	if err != nil {
-		return nil, err
+		return WidthHeight{}, err
 	}
 
 	return parseWidthHeight(string(out))
+}
+
+func (imgReq ImageReq) buildArgs() (string, error) {
+	// TODO(cgag): a tempfile system for caching?
+
+	stats, err := imgStats(imgReq.toPath())
+	if err != nil {
+		return "", err
+	}
+
+	args := ""
+	switch imgReq.Region.(type) {
+	case RegionFull:
+		break
+	case RegionExact:
+		region := imgReq.Region.(RegionExact)
+		args = fmt.Sprintf(
+			"%s -crop %dx%d+%d+%d",
+			args,
+			region.Width,
+			region.Height,
+			region.X,
+			region.Y)
+	case RegionPercent:
+		region := imgReq.Region.(RegionPercent)
+		offsetX := int(round(float64(stats.Width) * region.X / 100.0))
+		offsetY := int(round(float64(stats.Height) * region.Y / 100.0))
+		args = fmt.Sprintf(
+			"%s -crop %f%%x%f+%d+%d",
+			args,
+			region.Width,
+			region.Height,
+			offsetX,
+			offsetY,
+		)
+	default:
+		return "", fmt.Errorf("Unrecognized region type: %v", imgReq.Region)
+	}
+
+	switch imgReq.Size.(type) {
+	case SizeFull:
+		break
+	case SizeHeight:
+		fmt.Println("resizing height")
+		resize := imgReq.Size.(SizeHeight)
+		args = fmt.Sprintf(
+			"%s -resize x%d",
+			args,
+			resize.Height,
+		)
+	case SizeWidth:
+		fmt.Println("size width")
+		resize := imgReq.Size.(SizeWidth)
+		args = fmt.Sprintf(
+			"%s -resize %dx",
+			args,
+			resize.Width,
+		)
+	case SizeExact:
+		fmt.Println("resizing exact")
+		resize := imgReq.Size.(SizeExact)
+		args = fmt.Sprintf(
+			"%s -resize %dx%d!",
+			args,
+			resize.Width,
+			resize.Height,
+		)
+	case SizePercent:
+		resize := imgReq.Size.(SizePercent)
+		args = fmt.Sprintf(
+			"%s -resize %%%f",
+			args,
+			resize.Percent,
+		)
+	case SizeBestFit:
+		resize := imgReq.Size.(SizeBestFit)
+		args = fmt.Sprintf(
+			"%s -resize %dx%d",
+			args,
+			resize.Width,
+			resize.Height,
+		)
+	default:
+		return "", fmt.Errorf("Unrecognized size type: %v\n", imgReq.Size)
+	}
+
+	switch imgReq.Rotation.(type) {
+	case RotateStandard:
+		// taken straight from riiif, don't understand the need for
+		// virtualpixel
+		rotation := imgReq.Rotation.(RotateStandard)
+		args = fmt.Sprintf(
+			"%s -rotate %f",
+			args,
+			rotation.Degrees,
+		)
+	case RotateMirrored:
+		rotation := imgReq.Rotation.(RotateMirrored)
+		args = fmt.Sprintf(
+			"%s -flop -rotate %f",
+			args,
+			rotation.Degrees,
+		)
+		break
+	default:
+		return "", fmt.Errorf("Unrecognized rotation : %v\n", imgReq.Rotation)
+	}
+
+	switch imgReq.Quality {
+	case "default":
+		break
+	case "color":
+		break
+	case "gray":
+		args = fmt.Sprintf(
+			"%s -colorspace Gray",
+			args,
+		)
+	case "bitonal":
+		args = fmt.Sprintf(
+			"%s -colorspace Gray -type Bilevel",
+			args,
+		)
+	default:
+		return "", fmt.Errorf("Unrecognized Quality : %v\n", imgReq.Quality)
+	}
+
+	// Output to stdout.
+	args = fmt.Sprintf("%s %s %s:-", args, imgReq.toPath(), imgReq.Format)
+
+	return args, nil
 }
 
 //////////////
@@ -568,7 +615,7 @@ func parseSize(size string) (interface{}, error) {
 
 	// BestFit (Dealers Choice)
 	if strings.HasPrefix(size, "!") {
-		// Drop ! and parse
+		// Drop !
 		wh, err := parseWidthHeight(size[1:])
 		if err != nil {
 			return nil, err
@@ -669,10 +716,10 @@ func parseFormat(format string) (*string, error) {
 }
 
 // parse width/height of form "w,h"
-func parseWidthHeight(size string) (*WidthHeight, error) {
+func parseWidthHeight(size string) (WidthHeight, error) {
 	parts := strings.Split(size, ",")
 	if len(parts) != 2 {
-		return nil, errors.New(ErrCouldNotWidthHeight)
+		return WidthHeight{}, errors.New(ErrCouldNotWidthHeight)
 	}
 
 	wStr, hStr := parts[0], parts[1]
@@ -680,17 +727,27 @@ func parseWidthHeight(size string) (*WidthHeight, error) {
 	w64, err := strconv.ParseInt(wStr, 10, 64)
 	w := int(w64)
 	if err != nil {
-		return nil, errors.New(ErrCouldNotWidthHeight)
+		return WidthHeight{}, errors.New(ErrCouldNotWidthHeight)
 	}
 
 	h64, err := strconv.ParseInt(hStr, 10, 64)
 	h := int(h64)
 	if err != nil {
-		return nil, errors.New(ErrCouldNotWidthHeight)
+		return WidthHeight{}, errors.New(ErrCouldNotWidthHeight)
 	}
 
-	return &WidthHeight{
+	return WidthHeight{
 		Width:  w,
 		Height: h,
 	}, nil
+}
+
+// rand utils
+
+// are you kidding me golang
+func round(a float64) float64 {
+	if a < 0 {
+		return math.Ceil(a - 0.5)
+	}
+	return math.Floor(a + 0.5)
 }
