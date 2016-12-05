@@ -1,9 +1,12 @@
 package main
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math"
 	"mime"
@@ -12,10 +15,10 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/gorilla/handlers"
+	"github.com/Sirupsen/logrus"
 	"github.com/gorilla/mux"
-	"github.com/rs/cors"
 )
 
 const (
@@ -34,6 +37,8 @@ const (
 	// ErrInvalidFormat .
 	ErrInvalidFormat = "Invalid format"
 )
+
+var validFormats = []string{"jpg", "tif", "png", "gif", "jp2", "pdf", "webp"}
 
 // WidthHeight .
 type WidthHeight struct {
@@ -152,77 +157,169 @@ type Profile struct {
 	Formats []string `json:"formats"`
 }
 
+// Job .
+type Job struct {
+	Cmd      string
+	RespChan chan []byte
+}
+
+// Context .
+type Context struct {
+	workerChan chan string
+}
+
+// ContextHandler .
+type ContextHandler struct {
+	ctx     Context
+	handler func(ctx Context, w http.ResponseWriter, r *http.Request)
+}
+
 func main() {
+	// TODO(cgag): need a worker pool (num cpus)
+	// TODO(cgag): need memory limits as well.
+
+	jobChan := make(chan Job)
+	// TODO(cgag): more workers? or can we rely on imagemagic to use
+	// use all the cores?  Is it worth breaking imagemagick's memory usage
+	// heuristics?
+	go func() {
+		for {
+			job := <-jobChan
+			fmt.Printf("cmd :%s\n", job.Cmd)
+		}
+	}()
+
 	router := mux.NewRouter()
 
 	router.HandleFunc("/", helloHandler)
 	// TODO(cgag): prefix is optional, need to handle that as well
 	router.HandleFunc("/{prefix}/{identifier}", baseRedirect)
-	router.HandleFunc("/{prefix}/{identifier}/{region}/{size}/{rotation}/{quality}.{format}", iiifHandler)
+	router.HandleFunc(
+		"/{prefix}/{identifier}/{region}/{size}/{rotation}/{quality}.{format}",
+		iiifHandler)
 	router.HandleFunc("/{prefix}/{identifier}/info.json", infoHandler)
 
-	// TODO(cgag): request timing
+	// TODO(cgag): Get port from env with a default
 	s := &http.Server{
-		Addr: ":8080",
-		// Handler: handlers.CORS()(handlers.CombinedLoggingHandler(os.Stdout, router)),
-		Handler: cors.Default().Handler(handlers.CombinedLoggingHandler(os.Stdout, router)),
+		Addr:    ":8080",
+		Handler: mkLoggingHandler(router),
 	}
 
-	log.Printf("Listening on: %s", s.Addr)
-	s.ListenAndServe()
+	logrus.Infof("Listening on: %s", s.Addr)
+	err := s.ListenAndServe()
+	if err != nil {
+		logrus.Errorf("Error starting server: %#v", s)
+	}
 }
 
 func baseRedirect(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	prefix, ok := vars["prefix"]
 	if !ok {
-		log.Panicln("Failed to parse prefix from URL")
+		logrus.Error("Failed to parse prefix from URL")
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
 
 	identifier, ok := vars["identifier"]
 	if !ok {
-		log.Panicln("Failed to parse identifier from URL")
+		logrus.Error("Failed to parse identifier from URL")
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
 
 	http.Redirect(w, r, "/"+prefix+"/"+identifier+"/info.json", http.StatusSeeOther)
 }
 
 func helloHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "iiif hello 2")
+	fmt.Fprintf(w, "iiif server")
+}
+
+func md5str(s string) string {
+	x := md5.New()
+	x.Write([]byte(s))
+	b := x.Sum(nil)
+	return hex.EncodeToString(b[:])
 }
 
 func iiifHandler(w http.ResponseWriter, r *http.Request) {
+
+	cacheDir := "iiifCache"
+	if err := os.Mkdir(cacheDir, os.FileMode(0755)); err != nil {
+		if !os.IsExist(err) {
+			logrus.Errorf("err creating cache dir: %s", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+
+	cacheFilepath := cacheDir + "/" + md5str(r.URL.String())
+
+	// TODO(cgag): all these hardcoded /'s fuck up portability
+	cachedFile, err := os.Open(cacheFilepath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logrus.Errorf("Unforseen problem opening cached file: %s", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+
 	imgReq, err := imageReq(r)
 	if err != nil {
-		fmt.Printf("err: %s\n", err)
+		logrus.Errorf("error with imageReq: %s", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
+	w.Header().Set("Link", "<http://iiif.io/api/image/2/level1.json>;rel=\"profile\"")
+	w.Header().Set("Content-Type", mime.TypeByExtension("."+imgReq.Format))
+
+	if cachedFile != nil {
+		logrus.Info("cache hit")
+		bytes, err := ioutil.ReadAll(cachedFile)
+		if err != nil {
+			logrus.Error("couldn't read cached file")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Write(bytes)
+		return
+	}
+
+	logrus.Info("cache miss")
+
 	if !imgExists(imgReq.toPath()) {
-		fmt.Printf("no such image: %s\n", imgReq.toPath())
+		logrus.Infof("no such image: %s", imgReq.toPath())
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
 	args, err := imgReq.buildArgs()
 	if err != nil {
+		logrus.Errorf("%s", err)
+		fmt.Fprintf(w, "Error with request:  %s", err)
 		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintf(w, "Error with request:  %s\n", err)
 		return
 	}
 
-	fmt.Printf("\n\nargs: %s\n\n", args)
 	splitArgs := strings.Split(strings.TrimSpace(args), " ")
 	out, err := exec.Command("convert", splitArgs...).Output()
 	if err != nil {
-		fmt.Printf("err running convert: %s\n\n", err)
+		logrus.Errorf("err running convert: %s", err)
+		logrus.Errorf("args were: %s", args)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	fmt.Printf("mime type: %s\n", mime.TypeByExtension("."+imgReq.Format))
-	w.Header().Set("Content-Type", mime.TypeByExtension("."+imgReq.Format))
+	// write cache
+	err = ioutil.WriteFile(cacheFilepath, out, os.FileMode(0755))
+	if err != nil {
+		logrus.Errorf("err writing file: %s", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
 	w.Write(out)
 }
 
@@ -239,16 +336,17 @@ func infoHandler(w http.ResponseWriter, r *http.Request) {
 	iReq := infoReq(r)
 	iResp, err := iReq.infoResp()
 	if err != nil {
-		fmt.Printf("err: %s", err)
-		w.WriteHeader(http.StatusNotFound)
+		logrus.Errorf("err handling info request: %s", err)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	json.NewEncoder(w).Encode(iResp)
+
+	if err = json.NewEncoder(w).Encode(iResp); err != nil {
+		logrus.Errorf("Error encoding infoResponse to JSON: %#v", iResp)
+	}
 }
 
 func (iReq InfoReq) infoResp() (*ImageInfo, error) {
-	// TODO(cgag): where should "test_images" have come from? Is using
-	// Prefix reasonable?
 	formats, err := getFormats(iReq.Identifier)
 	if err != nil {
 		return nil, err
@@ -275,11 +373,9 @@ func (iReq InfoReq) infoResp() (*ImageInfo, error) {
 }
 
 func getFormats(identifier string) ([]string, error) {
-	possibleFormats := []string{"png", "jpg", "tiff", "jp", "jp2"}
 	// TODO(cgag): parallelize?
 	var found []string
-	for _, format := range possibleFormats {
-		// TODO(cgag): parallel?
+	for _, format := range validFormats {
 		path := "./images/" + identifier + "." + format
 		if _, err := os.Stat(path); err == nil {
 			found = append(found, format)
@@ -302,12 +398,14 @@ func imgStats(filepath string) (WidthHeight, error) {
 	if err != nil {
 		return WidthHeight{}, err
 	}
-
 	return parseWidthHeight(string(out))
 }
 
 func (imgReq ImageReq) buildArgs() (string, error) {
 	// TODO(cgag): a tempfile system for caching?
+
+	// TODO(cgag): do this once in main...
+	convertMemLimit := os.Getenv("CONVERT_MEM_LIMIT")
 
 	stats, err := imgStats(imgReq.toPath())
 	if err != nil {
@@ -347,7 +445,6 @@ func (imgReq ImageReq) buildArgs() (string, error) {
 	case SizeFull:
 		break
 	case SizeHeight:
-		fmt.Println("resizing height")
 		resize := imgReq.Size.(SizeHeight)
 		args = fmt.Sprintf(
 			"%s -resize x%d",
@@ -355,7 +452,6 @@ func (imgReq ImageReq) buildArgs() (string, error) {
 			resize.Height,
 		)
 	case SizeWidth:
-		fmt.Println("size width")
 		resize := imgReq.Size.(SizeWidth)
 		args = fmt.Sprintf(
 			"%s -resize %dx",
@@ -363,7 +459,6 @@ func (imgReq ImageReq) buildArgs() (string, error) {
 			resize.Width,
 		)
 	case SizeExact:
-		fmt.Println("resizing exact")
 		resize := imgReq.Size.(SizeExact)
 		args = fmt.Sprintf(
 			"%s -resize %dx%d!",
@@ -392,14 +487,14 @@ func (imgReq ImageReq) buildArgs() (string, error) {
 
 	switch imgReq.Rotation.(type) {
 	case RotateStandard:
-		// taken straight from riiif, don't understand the need for
-		// virtualpixel
 		rotation := imgReq.Rotation.(RotateStandard)
-		args = fmt.Sprintf(
-			"%s -rotate %f",
-			args,
-			rotation.Degrees,
-		)
+		if rotation.Degrees != 0 {
+			args = fmt.Sprintf(
+				"%s -rotate %f",
+				args,
+				rotation.Degrees,
+			)
+		}
 	case RotateMirrored:
 		rotation := imgReq.Rotation.(RotateMirrored)
 		args = fmt.Sprintf(
@@ -407,7 +502,6 @@ func (imgReq ImageReq) buildArgs() (string, error) {
 			args,
 			rotation.Degrees,
 		)
-		break
 	default:
 		return "", fmt.Errorf("Unrecognized rotation : %v\n", imgReq.Rotation)
 	}
@@ -429,6 +523,10 @@ func (imgReq ImageReq) buildArgs() (string, error) {
 		)
 	default:
 		return "", fmt.Errorf("Unrecognized Quality : %v\n", imgReq.Quality)
+	}
+
+	if convertMemLimit != "" {
+		args = fmt.Sprintf("%s -limit memory %s", args, convertMemLimit)
 	}
 
 	// Output to stdout.
@@ -641,6 +739,7 @@ func parseSize(size string) (interface{}, error) {
 				Height: wh.Height,
 			}, nil
 		}
+
 		if w != "" && h == "" {
 			w64, err := strconv.ParseInt(w, 10, 64)
 			width := int(w64)
@@ -649,6 +748,7 @@ func parseSize(size string) (interface{}, error) {
 			}
 			return SizeWidth{Width: width}, nil
 		}
+
 		if w == "" && h != "" {
 			h64, err := strconv.ParseInt(h, 10, 64)
 			height := int(h64)
@@ -702,7 +802,8 @@ func parseQuality(quality string) (*string, error) {
 }
 
 func parseFormat(format string) (*string, error) {
-	validFormats := []string{"jpg", "tif", "png", "gif", "jp2", "pdf", "webp"}
+	// TODO(cgag): document these strings.  Shoudl we accept things like
+	// jpeg vs jpg?
 	found := false
 	for _, valid := range validFormats {
 		if format == valid {
@@ -750,4 +851,76 @@ func round(a float64) float64 {
 		return math.Ceil(a - 0.5)
 	}
 	return math.Floor(a + 0.5)
+}
+
+// logging
+
+// HTTPLog .
+type HTTPLog struct {
+	http.ResponseWriter
+	ip           string
+	time         time.Time
+	method       string
+	uri          string
+	protocol     string
+	status       int
+	bytesWritten int64
+	elapsedTime  time.Duration
+}
+
+func (r *HTTPLog) Write(p []byte) (int, error) {
+	written, err := r.ResponseWriter.Write(p)
+	r.bytesWritten += int64(written)
+	return written, err
+}
+
+// WriteHeader .
+func (r *HTTPLog) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+// LoggingHandler .
+type LoggingHandler struct {
+	handler http.Handler
+}
+
+func mkLoggingHandler(handler http.Handler) http.Handler {
+	return &LoggingHandler{
+		handler: handler,
+	}
+}
+
+func (h *LoggingHandler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
+	clientIP := r.RemoteAddr
+	if colon := strings.LastIndex(clientIP, ":"); colon != -1 {
+		clientIP = clientIP[:colon]
+	}
+
+	record := &HTTPLog{
+		ResponseWriter: rw,
+		time:           time.Time{},
+		status:         http.StatusOK,
+		method:         r.Method,
+		uri:            r.RequestURI,
+		protocol:       r.Proto,
+		ip:             clientIP,
+		elapsedTime:    time.Duration(0),
+	}
+
+	startTime := time.Now()
+	h.handler.ServeHTTP(record, r)
+	finishTime := time.Now()
+
+	record.time = startTime.UTC()
+	record.elapsedTime = finishTime.Sub(startTime)
+
+	logrus.WithFields(logrus.Fields{
+		"time":     record.time.Format(time.RFC3339),
+		"status":   record.status,
+		"method":   record.method,
+		"protocol": r.Proto,
+		"clientIP": record.ip,
+		"elapsed":  record.elapsedTime,
+	}).Info(record.uri)
 }

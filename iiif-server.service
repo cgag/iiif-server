@@ -8,7 +8,7 @@ Restart=always
 TimeoutStartSec=0
 ExecStartPre=-/usr/bin/docker kill iiif-server
 ExecStartPre=-/usr/bin/docker rm iiif-server
-ExecStart=/usr/bin/docker run --rm -p 8080:8080 --name iiif-server iiif-server
+ExecStart=/usr/bin/docker run --rm -p 8080:8080 -e CONVERT_MEM_LIMIT=50MiB --name iiif-server iiif-server
 
 [Install]
 WantedBy=multi-user.target
