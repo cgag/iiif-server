@@ -26,11 +26,13 @@ RUN apt-get update -y && apt-get install -y \
     zlib1g-dev        \
     libmagick-dev
 
+# welp, just wgetting latest and then assuming what directory to cd into,
+# terrible.
 RUN wget http://www.imagemagick.org/download/ImageMagick.tar.gz  && \
     tar -xvzf ImageMagick.tar.gz && \
-    cd ImageMagick-7.0.3-8 &&       \
+    cd ImageMagick-7.0.7-4 &&       \
     ./configure &&                  \
-    make -j5 &&                     \
+    make -j 16 &&                     \
     make install &&                 \
     ldconfig
 
