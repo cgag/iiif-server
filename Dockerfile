@@ -30,7 +30,7 @@ RUN apt-get update -y && apt-get install -y \
 # terrible.
 RUN wget http://www.imagemagick.org/download/ImageMagick.tar.gz  && \
     tar -xvzf ImageMagick.tar.gz && \
-    cd ImageMagick-7.0.7-4 &&       \
+    cd ImageMagick-7.0.8-17 &&       \
     ./configure &&                  \
     make -j 16 &&                     \
     make install &&                 \
